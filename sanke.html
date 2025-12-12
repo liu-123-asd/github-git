@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>AI 手势贪吃蛇</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1a1a1a;
+            overflow: hidden;
+            font-family: 'Segoe UI', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+
+        /* 游戏容器，保持视频比例 */
+        #game-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            max-width: 1280px;
+            max-height: 720px;
+            background: #000;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+        }
+
+        /* 视频层（隐藏，只用于采集） */
+        #input-video {
+            display: none;
+        }
+
+        /* 画布层（覆盖在视频上） */
+        #output-canvas {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1); /* 镜像翻转，让操作符合直觉 */
+        }
+
+        /* UI 层 */
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px; /* 因为Canvas翻转了，视觉上的左边其实是DOM的右边，但为了简单，我们用绝对定位不翻转的容器 */
+            z-index: 10;
+            color: white;
+            pointer-events: none;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+        }
+
+        /* 由于Canvas是镜像的，我们把UI层放在一个不翻转的容器里，覆盖在Canvas之上 */
+        #ui-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            pointer-events: none;
+            z-index: 20;
+        }
+
+        .score-box {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 24px;
+            font-weight: bold;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 10px 20px;
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 20px;
+            background: rgba(0,0,0,0.7);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            z-index: 30;
+        }
+
+        .dot {
+            display: inline-block;
+            width: 15px;
+            height: 15px;
+            background-color: #ff4757;
+            border-radius: 50%;
+            margin-right: 5px;
+        }
+    </style>
+    
+    <!-- 引入 MediaPipe 库 -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="game-container">
+        <video id="input-video" playsinline></video>
+        <canvas id="output-canvas"></canvas>
+        
+        <div id="ui-overlay">
+            <div class="score-box">
+                <div class="dot"></div>
+                <span id="score-text">0</span>
+            </div>
+            
+            <div id="loading" class="loading">
+                正在加载 AI 模型...<br>
+                <small>请允许摄像头权限</small>
+            </div>
+        </div>
+    </div>
+
+<script>
+    // --- 游戏配置 ---
+    const CONFIG = {
+        snakeSpeed: 0.15, // 蛇头跟随手指的平滑度 (0.0 - 1.0)
+        segmentDist: 15,  // 蛇身节点间距
+        startLength: 10,  // 初始长度
+        growAmount: 5,    // 吃到苹果增加的长度
+        appleRadius: 15,  // 苹果半径
+        headRadius: 20    // 蛇头半径
+    };
+
+    // --- 变量初始化 ---
+    const videoElement = document.getElementById('input-video');
+    const canvasElement = document.getElementById('output-canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const scoreElement = document.getElementById('score-text');
+    const loadingElement = document.getElementById('loading');
+
+    let score = 0;
+    let canvasWidth, canvasHeight;
+
+    // 游戏状态
+    let fingerPos = { x: 0, y: 0, active: false }; // 实际手指位置（归一化 0-1）
+    let snakeHead = { x: 0, y: 0 }; // 游戏中的蛇头坐标（像素）
+    let snakeBody = []; // 蛇身数组
+    let apple = { x: 0, y: 0 };
+    let particles = []; // 爆炸粒子
+
+    // 初始化画布尺寸
+    function resizeCanvas() {
+        const rect = document.getElementById('game-container').getBoundingClientRect();
+        canvasElement.width = rect.width;
+        canvasElement.height = rect.height;
+        canvasWidth = rect.width;
+        canvasHeight = rect.height;
+        
+        // 初始位置放在屏幕中心
+        snakeHead = { x: canvasWidth / 2, y: canvasHeight / 2 };
+        
+        // 初始化蛇身
+        snakeBody = [];
+        for (let i = 0; i < CONFIG.startLength; i++) {
+            snakeBody.push({ x: snakeHead.x, y: snakeHead.y + i * CONFIG.segmentDist });
+        }
+        respawnApple();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+
+    // --- 游戏逻辑类 ---
+
+    function respawnApple() {
+        // 随机生成苹果，留出边缘缓冲
+        const margin = 50;
+        apple.x = margin + Math.random() * (canvasWidth - margin * 2);
+        apple.y = margin + Math.random() * (canvasHeight - margin * 2);
+    }
+
+    // 线性插值，让移动更平滑
+    function lerp(start, end, amt) {
+        return (1 - amt) * start + amt * end;
+    }
+
+    // 更新蛇身物理
+    function updateSnake() {
+        // 1. 更新蛇头位置
+        if (fingerPos.active) {
+            // 将归一化坐标转为像素坐标
+            // 注意：MediaPipe 坐标 x=0 在左边。但因为我们 CSS 翻转了 Canvas，
+            // 视觉上 x=0 在右边。为了逻辑一致，我们不需要在逻辑层翻转坐标，
+            // 直接映射，渲染层已经处理了镜像。
+            const targetX = fingerPos.x * canvasWidth;
+            const targetY = fingerPos.y * canvasHeight;
+
+            // 平滑移动蛇头
+            snakeHead.x = lerp(snakeHead.x, targetX, CONFIG.snakeSpeed);
+            snakeHead.y = lerp(snakeHead.y, targetY, CONFIG.snakeSpeed);
+        }
+
+        // 2. 蛇身跟随 (Inverse Kinematics 简化版 - 拖拽法)
+        // 第一个身体节点跟随头
+        dragSegment(0, snakeHead.x, snakeHead.y);
+        
+        // 后续节点跟随前一个节点
+        for (let i = 1; i < snakeBody.length; i++) {
+            dragSegment(i, snakeBody[i-1].x, snakeBody[i-1].y);
+        }
+    }
+
+    function dragSegment(i, targetX, targetY) {
+        const segment = snakeBody[i];
+        const dx = targetX - segment.x;
+        const dy = targetY - segment.y;
+        const angle = Math.atan2(dy, dx);
+        const dist = Math.hypot(dx, dy);
+
+        // 如果距离大于设定间距，拉近节点
+        if (dist > CONFIG.segmentDist) {
+            // 新位置 = 目标位置 - 向量方向 * 间距
+            // 这样让节点始终保持在目标后面固定的距离
+            segment.x = targetX - Math.cos(angle) * CONFIG.segmentDist;
+            segment.y = targetY - Math.sin(angle) * CONFIG.segmentDist;
+        }
+    }
+
+    // 碰撞检测
+    function checkCollision() {
+        const dx = snakeHead.x - apple.x;
+        const dy = snakeHead.y - apple.y;
+        const dist = Math.hypot(dx, dy);
+
+        if (dist < CONFIG.headRadius + CONFIG.appleRadius) {
+            // 吃到苹果
+            score += 10;
+            scoreElement.innerText = score;
+            
+            // 增加蛇身
+            const tail = snakeBody[snakeBody.length - 1];
+            for(let k=0; k<CONFIG.growAmount; k++) {
+                snakeBody.push({ x: tail.x, y: tail.y });
+            }
+
+            // 特效
+            createParticles(apple.x, apple.y);
+            respawnApple();
+        }
+    }
+
+    // 粒子系统
+    function createParticles(x, y) {
+        for (let i = 0; i < 10; i++) {
+            particles.push({
+                x: x,
+                y: y,
+                vx: (Math.random() - 0.5) * 10,
+                vy: (Math.random() - 0.5) * 10,
+                life: 1.0,
+                color: `hsl(${Math.random() * 360}, 100%, 50%)`
+            });
+        }
+    }
+
+    function updateAndDrawParticles() {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let p = particles[i];
+            p.x += p.vx;
+            p.y += p.vy;
+            p.life -= 0.05;
+            
+            if (p.life <= 0) {
+                particles.splice(i, 1);
+            } else {
+                canvasCtx.globalAlpha = p.life;
+                canvasCtx.fillStyle = p.color;
+                canvasCtx.beginPath();
+                canvasCtx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+                canvasCtx.fill();
+            }
+        }
+        canvasCtx.globalAlpha = 1.0;
+    }
+
+    // --- 渲染循环 ---
+    function draw() {
+        // 清空画布
+        canvasCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+
+        // 1. 绘制视频帧 (背景)
+        // 必须保存上下文状态，因为视频本身不需要额外的 CSS 镜像处理，
+        // 我们通过drawImage来控制。
+        // 由于CSS中 #output-canvas 已经是 scaleX(-1) 了，
+        // 所以我们正常画视频，视频在画布上是正的，但画布被CSS翻转显示给用户。
+        // 这意味着：如果在画布左边(x=0)画图，用户看到的是在右边。
+        // MediaPipe给的坐标是归一化的，通常前置摄像头看起来是镜面。
+        canvasCtx.drawImage(videoElement, 0, 0, canvasWidth, canvasHeight);
+
+        // 2. 绘制苹果
+        canvasCtx.beginPath();
+        canvasCtx.arc(apple.x, apple.y, CONFIG.appleRadius, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = '#ff4757';
+        canvasCtx.shadowBlur = 15;
+        canvasCtx.shadowColor = '#ff4757';
+        canvasCtx.fill();
+        canvasCtx.shadowBlur = 0;
+
+        // 3. 绘制蛇身
+        // 从尾巴画到头，这样头在最上面
+        for (let i = snakeBody.length - 1; i >= 0; i--) {
+            const segment = snakeBody[i];
+            const size = CONFIG.headRadius * (1 - (i / (snakeBody.length + 5)) * 0.5); // 身体逐渐变细
+            
+            canvasCtx.beginPath();
+            canvasCtx.arc(segment.x, segment.y, size, 0, 2 * Math.PI);
+            // 彩虹色
+            canvasCtx.fillStyle = `hsl(${(i * 5 + Date.now() / 10) % 360}, 70%, 60%)`;
+            canvasCtx.fill();
+        }
+
+        // 4. 绘制蛇头
+        canvasCtx.beginPath();
+        canvasCtx.arc(snakeHead.x, snakeHead.y, CONFIG.headRadius, 0, 2 * Math.PI);
+        canvasCtx.fillStyle = '#ffffff';
+        canvasCtx.shadowBlur = 10;
+        canvasCtx.shadowColor = 'white';
+        canvasCtx.fill();
+        canvasCtx.shadowBlur = 0;
+
+        // 眼睛
+        // 计算头的角度
+        let angle = 0;
+        if(snakeBody.length > 0) {
+            angle = Math.atan2(snakeHead.y - snakeBody[0].y, snakeHead.x - snakeBody[0].x);
+        }
+        
+        // 简单的眼睛绘制
+        const eyeOffset = CONFIG.headRadius * 0.4;
+        const eyeX1 = snakeHead.x + Math.cos(angle - 0.5) * eyeOffset;
+        const eyeY1 = snakeHead.y + Math.sin(angle - 0.5) * eyeOffset;
+        const eyeX2 = snakeHead.x + Math.cos(angle + 0.5) * eyeOffset;
+        const eyeY2 = snakeHead.y + Math.sin(angle + 0.5) * eyeOffset;
+
+        canvasCtx.fillStyle = 'black';
+        canvasCtx.beginPath(); canvasCtx.arc(eyeX1, eyeY1, 4, 0, Math.PI*2); canvasCtx.fill();
+        canvasCtx.beginPath(); canvasCtx.arc(eyeX2, eyeY2, 4, 0, Math.PI*2); canvasCtx.fill();
+
+        // 5. 粒子
+        updateAndDrawParticles();
+        
+        // 6. 调试信息（如果没有检测到手）
+        if (!fingerPos.active) {
+            canvasCtx.fillStyle = 'rgba(0,0,0,0.5)';
+            canvasCtx.fillRect(0, canvasHeight/2 - 30, canvasWidth, 60);
+            canvasCtx.fillStyle = 'white';
+            canvasCtx.font = '20px Arial';
+            canvasCtx.textAlign = 'center';
+            // 因为Canvas被镜像了，字也会反，所以我们需要反向绘制文字
+            canvasCtx.save();
+            canvasCtx.translate(canvasWidth / 2, canvasHeight / 2);
+            canvasCtx.scale(-1, 1); // 把文字翻回来
+            canvasCtx.fillText("请在摄像头前伸出食指", 0, 8);
+            canvasCtx.restore();
+        }
+    }
+
+    // 游戏主循环 (与 MediaPipe 分离，保持高帧率)
+    function gameLoop() {
+        updateSnake();
+        checkCollision();
+        draw();
+        requestAnimationFrame(gameLoop);
+    }
+
+    // --- MediaPipe 设置 ---
+
+    function onResults(results) {
+        loadingElement.style.display = 'none';
+
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+            // 获取食指指尖 (索引 8)
+            const indexFingerTip = landmarks[8];
+            
+            // 更新全局变量
+            fingerPos.x = indexFingerTip.x;
+            fingerPos.y = indexFingerTip.y;
+            fingerPos.active = true;
+        } else {
+            fingerPos.active = false;
+        }
+    }
+
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+    });
+
+    hands.onResults(onResults);
+
+    // 启动摄像头
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 1280,
+        height: 720
+    });
+    
+    // 开始运行
+    camera.start().then(() => {
+        // 启动游戏循环
+        gameLoop();
+    }).catch(err => {
+        console.error("Camera error:", err);
+        loadingElement.innerHTML = "无法启动摄像头<br>请检查权限或刷新页面";
+    });
+
+</script>
+</body>
+</html>
