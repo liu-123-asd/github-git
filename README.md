@@ -1,0 +1,3 @@
+Completely interactive code generated in one go by Gemini
+Open the browser and authorize the camera ...
+I am an AI enthusiast (with a focus on deep learning) and am interested in communicating with you.
